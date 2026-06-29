@@ -1,1 +1,357 @@
-# ai201-project4-provenance-guard
+# Provenance Guard — README.md
+
+Provenance Guard is a backend API that classifies submitted text as likely AI-generated or
+human-written, returns a confidence score, generates a transparency label (high-confidence AI, high-confidence human, or uncertain) for users, and
+handles creator appeals. It is designed to plug into any creative-sharing platform.
+
+---
+
+## System Architecture
+
+A submitted piece of text travels through two independent detection signals — an LLM
+classifier (Groq) and a stylometric heuristic analyzer — whose outputs are combined into
+a single confidence score. That score maps to one of three transparency label variants,
+the full decision is written to a SQLite audit log, and the result is returned to the caller.
+
+An appeal enters separately: the system looks up the original decision, validates the
+creator, flips the status to `under_review`, appends the appeal to the audit log, and
+returns a confirmation. No automatic re-classification happens.
+
+See [planning.md](planning.md) for the full architecture diagram, signal design rationale,
+and the AI Tool Plan used to generate implementation code.
+
+---
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/submit` | Submit content for classification |
+| `POST` | `/appeal` | Submit an appeal for a prior decision |
+| `GET` | `/log` | Retrieve recent audit log entries |
+
+### POST /submit
+
+**Request body:**
+```json
+{
+  "content_id": "poem-001",
+  "creator_id": "user-42",
+  "content": "The text to classify..."
+}
+```
+
+**Response:**
+```json
+{
+  "content_id": "poem-001",
+  "attribution": "AI",
+  "confidence": 0.81,
+  "label_text": "Attribution: Likely AI-Generated\n...",
+  "signals": {
+    "llm_score": 0.88,
+    "stylo_score": 0.67
+  }
+}
+```
+
+**HTTP status codes:**
+- `200` — Classification completed successfully
+- `422` — Missing or invalid request data (e.g., missing `content`)
+- `429` — Rate limit exceeded
+
+### POST /appeal
+
+**Request body:**
+```json
+{
+  "content_id": "poem-001",
+  "creator_id": "user-42",
+  "reasoning": "I wrote this poem by hand over two weeks. It reflects my personal style."
+}
+```
+
+**Response:**
+```json
+{
+  "content_id": "poem-001",
+  "status": "under_review",
+  "message": "Your appeal has been received and this content is now under review."
+}
+```
+
+**HTTP status codes:**
+- `200` — Appeal accepted
+- `403` — `creator_id` does not match the original submission
+- `404` — `content_id` not found
+- `422` — `reasoning` is fewer than 10 characters
+- `429` — Rate limit exceeded
+
+### GET /log
+
+Returns the most recent audit log entries ordered by submission time (newest first).
+
+**HTTP status codes:**
+- `200` — Log entries returned successfully
+- `429` — Rate limit exceeded
+
+---
+
+## Detection Signals
+
+### Signal 1 — LLM Classifier (Groq llama-3.3-70b-versatile)
+
+Sends the text to the LLM with a structured prompt asking it to assess whether the writing
+reads as AI-generated or human-written. Returns a probability score and brief reasoning.
+
+- **Measures:** Semantic coherence, stylistic consistency, formulaic phrasing, naturalness of
+  voice, structural predictability.
+- **Output:** `llm_score` float 0.0–1.0 (higher = more AI-like). The LLM also returns a `reasoning` string that is intentionally discarded — storing model-generated explanations that may be inconsistent across model versions adds noise without value. Only the numerical score is retained.
+- **Blind spot:** Formal human writing (academic papers, legal memos) often scores high
+  because it shares tonal uniformity with AI output.
+
+### Signal 2 — Stylometric Heuristics (pure Python)
+
+Computes five measurable statistical properties of the text and combines them into a single
+score. Each metric captures a different structural dimension.
+
+| Metric | What it captures | AI pattern |
+|---|---|---|
+| Sentence length variance | Rhythmic consistency | AI = very uniform (low variance) |
+| Type-token ratio (TTR) | Vocabulary diversity | AI = moderate; humans more irregular |
+| Punctuation density | Expressive punctuation | AI = sparse and regular |
+| Average word length | Diction register | AI = slightly elevated |
+| Paragraph/sentence ratio | Structural regularity | AI = even distribution |
+
+- **Output:** `stylo_score` float 0.0–1.0 (higher = more AI-like)
+- **Blind spot:** Short or poetic texts (< 80 words) lack enough statistical signal. Metric
+  reliability drops and the signal is given near-zero weight in those cases.
+
+### Combination Formula
+
+Normal text (≥ 80 words):
+```
+final_score = 0.65 × llm_score + 0.35 × stylo_score
+```
+
+Short text (< 80 words):
+```
+final_score = 0.90 × llm_score + 0.10 × stylo_score
+```
+
+Weights in both cases sum to 1.0 (normalized). The LLM signal is weighted higher because it captures semantic intent — the primary distinguishing feature. Short texts reduce stylometric weight because the heuristic metrics require sufficient sample size to be reliable.
+
+---
+
+## Confidence Scoring
+
+The confidence score is a float between 0.0 and 1.0 where **higher = more AI-like**.
+
+| Score Range | Classification | What it means |
+|---|---|---|
+| 0.00 – 0.34 | Likely Human | Both signals agree on human characteristics |
+| 0.35 – 0.64 | Uncertain | Signals disagree or both returned mid-range values |
+| 0.65 – 1.00 | Likely AI | Both signals agree on AI characteristics |
+
+Because falsely labeling human work as AI is considered more harmful than missing some AI-generated work, borderline scores are intentionally routed into the wide uncertain band instead of forcing a binary decision.
+
+**A score of 0.51 vs. 0.95 (high-confidence score):** A 0.51 falls in the uncertain band — the system cannot make
+a confident call and says so explicitly to the user. A 0.95 is high-confidence AI and
+triggers the definitive AI label with no hedging. The key design choice is the wide uncertain
+band (30 points): it absorbs borderline cases rather than forcing a binary call, reflecting the
+asymmetry in harm — misclassifying a human's work as AI is worse than a false negative. The
+human (0–0.34) and AI (0.65–1.00) outer bands are roughly symmetric in width (34 vs. 35 points).
+
+**How scores were tested for meaningfulness:** The same three test inputs were run through both signals individually and combined, and scores were verified to move in the expected direction and route to the correct label variant.
+
+| Test Input | Expected Result |
+|---|---|
+| ChatGPT paragraph (copied verbatim) | Likely AI |
+| Personal journal entry | Likely Human |
+| Short experimental poem | Uncertain |
+
+---
+
+## Transparency Labels
+
+The label is the text shown directly to a reader on the platform. All three variants are
+reproduced verbatim below.
+
+### Variant A — Likely AI-Generated (score ≥ 0.65)
+
+```
+Attribution: Likely AI-Generated
+Confidence: High
+
+Our system analyzed the writing patterns and style of this piece and found strong
+indicators that it was generated with AI assistance. This is not a definitive judgment
+— our detection tools are not perfect, and some human writing styles can resemble
+AI-generated text.
+
+If you created this work yourself, you can submit an appeal and explain your process.
+We will review it and update this label.
+```
+
+### Variant B — Likely Human-Written (score ≤ 0.34)
+
+```
+Attribution: Likely Human-Written
+Confidence: High
+
+Our system analyzed the writing patterns and style of this piece and found strong
+indicators that it was written by a person. The language, structure, and style all
+appear consistent with human authorship.
+
+If this assessment seems wrong, you can submit an appeal at any time.
+```
+
+### Variant C — Unclear / Uncertain (score 0.35 – 0.64)
+
+```
+Attribution: Unclear
+Confidence: Low
+
+Our system analyzed this piece but could not make a confident determination about
+whether it was written by a person or generated with AI assistance. This can happen
+with short texts, experimental writing styles, or pieces that blend human and AI work.
+
+No action is taken based on an uncertain result. If you want to provide more context
+about how you created this work, you can submit an appeal.
+```
+
+---
+
+## Appeals Workflow
+
+Any creator can appeal a classification. Appeals require:
+- `content_id`: the ID of the classified piece
+- `creator_id`: must match the original submission record (simple string equality check — no authentication is implemented in this version)
+- `reasoning`: at least 10 characters explaining how the work was created
+
+On receipt:
+1. The system looks up the original decision.
+2. Validates `creator_id` against the submission record.
+3. Updates content status from `"decided"` to `"under_review"` (decision lifecycle: `decided` → `under_review`).
+4. Appends an appeal entry to the audit log with the reasoning and timestamp.
+5. Returns confirmation.
+
+The appeal does not trigger automatic re-classification. A human reviewer reads/inspect the full
+audit log entry including original scores, label, creator reasoning before deciding the outcome of the appeal.
+
+---
+
+## Rate Limiting
+
+Rate limiting is applied per IP address using Flask-Limiter with an in-memory store.
+
+| Endpoint | Limit | Reasoning |
+|---|---|---|
+| `POST /submit` | 10 / hour | A real writer submits infrequently. 10/hour covers heavy revision sessions without enabling adversarial probing (resistance to large-scale probing of the classifier: reverse-engineering the classifier needs thousands of samples). |
+| `POST /appeal` | 3 / hour | Appeals are deliberate, not bulk actions. 3/hour prevents appeal-spam that could overwhelm a reviewer queue. |
+| `GET /log` | 30 / hour | Allows normal reviewer use while preventing automated scraping that could expose patterns useful to adversaries. |
+
+Exceeding a limit returns HTTP 429 with a `Retry-After` header.
+
+---
+
+## Audit Log
+
+Every classification decision and appeal is persisted to SQLite in two tables.
+
+**`decisions` table columns:**
+
+| Column | Type | Description |
+|---|---|---|
+| `content_id` | TEXT PK | Unique ID from the submission |
+| `creator_id` | TEXT | Submitter identifier |
+| `submitted_at` | TEXT | ISO 8601 timestamp |
+| `content_preview` | TEXT | First 200 chars of submitted text |
+| `llm_score` | REAL | Raw output of Signal 1 |
+| `stylo_score` | REAL | Raw output of Signal 2 |
+| `final_score` | REAL | Weighted combined score |
+| `attribution` | TEXT | "AI" \| "Human" \| "Uncertain" |
+| `label_text` | TEXT | Exact label text shown to the user |
+| `status` | TEXT | "decided" \| "under_review" |
+
+**`appeals` table columns:**
+
+| Column | Type | Description |
+|---|---|---|
+| `appeal_id` | INTEGER PK | Auto-increment |
+| `content_id` | TEXT FK | Links to decisions |
+| `creator_id` | TEXT | Appealing creator |
+| `appealed_at` | TEXT | ISO 8601 timestamp |
+| `reasoning` | TEXT | Creator's explanation |
+
+**Sample audit log output** (from `GET /log` — returns a subset of the full schema; `content_preview` and `label_text` are omitted for brevity):
+
+```json
+[
+  {
+    "content_id": "poem-001",
+    "creator_id": "user-42",
+    "submitted_at": "2026-06-28T14:05:00Z",
+    "llm_score": 0.88,
+    "stylo_score": 0.67,
+    "final_score": 0.81,
+    "attribution": "AI",
+    "status": "decided"
+  },
+  {
+    "content_id": "story-007",
+    "creator_id": "user-11",
+    "submitted_at": "2026-06-28T14:12:00Z",
+    "llm_score": 0.21,
+    "stylo_score": 0.33,
+    "final_score": 0.25,
+    "attribution": "Human",
+    "status": "decided"
+  },
+  {
+    "content_id": "essay-003",
+    "creator_id": "user-88",
+    "submitted_at": "2026-06-28T14:20:00Z",
+    "llm_score": 0.54,
+    "stylo_score": 0.48,
+    "final_score": 0.52,
+    "attribution": "Uncertain",
+    "status": "under_review"
+  }
+]
+```
+
+---
+
+## Known Limitations
+
+- **Formal human writing** (legal memos, academic papers) can produce false positives because
+  it shares structural uniformity with AI text.
+- **Short or poetic text** (< 80 words) lacks enough data for reliable stylometric scoring.
+  The system reduces stylometric weight and widens the uncertain band for these inputs.
+- **Adversarially modified AI text** (prompted to add variance and typos) can partially fool
+  the stylometric signal. The LLM signal provides partial defense, but no system is robust
+  to deliberate mimicry.
+
+---
+
+## Setup
+
+```bash
+git clone <repo-url>
+cd ai201-project4-provenance-guard
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # add your GROQ_API_KEY
+python app.py
+```
+
+---
+
+## AI Usage
+
+This project was built with Claude Code assistance. The planning.md spec — architecture
+diagram, signal design, label variants, scoring thresholds — was written before any
+implementation code. That spec was then used as prompt context for generating each milestone.
+All generated code was reviewed against the spec before being merged. The transparency label
+text and scoring thresholds were designed independently, then implemented.
