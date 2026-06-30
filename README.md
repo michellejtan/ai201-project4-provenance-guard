@@ -35,16 +35,18 @@ and the AI Tool Plan used to generate implementation code.
 **Request body:**
 ```json
 {
-  "content_id": "poem-001",
   "creator_id": "user-42",
   "content": "The text to classify..."
 }
 ```
 
+`content_id` is generated server-side (not supplied by the client) to avoid collisions and
+client-spoofed IDs. It is returned in the response and used for appeals.
+
 **Response:**
 ```json
 {
-  "content_id": "poem-001",
+  "content_id": "3f7a2b1e-...",
   "attribution": "AI",
   "confidence": 0.81,
   "label_text": "Attribution: Likely AI-Generated\n...",

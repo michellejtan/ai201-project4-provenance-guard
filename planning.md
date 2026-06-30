@@ -24,7 +24,9 @@ automatic re-classification happens — a human reviewer reads the audit log lat
 ### System Flow (Submission)
 
 ```
-POST /submit  { content, content_id, creator_id }
+POST /submit  { content, creator_id }
+       │
+       ▼  generate content_id (server-side UUID)
        │
        ▼  raw text
 ┌─────────────────────────┐
