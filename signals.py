@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import statistics
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -39,6 +41,70 @@ def llm_signal(text):
     }
 
 
+def _clamp(value, low=0.0, high=1.0):
+    return max(low, min(high, value))
+
+
+def stylo_signal(text):
+    paragraphs = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()] or [text.strip()]
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    words = re.findall(r"[A-Za-z']+", text)
+
+    sentence_lengths = [len(re.findall(r"[A-Za-z']+", s)) for s in sentences]
+
+    # 1. Sentence length variance: low variance (low coefficient of variation) = AI-like.
+    if len(sentence_lengths) >= 2 and statistics.mean(sentence_lengths) > 0:
+        cv = statistics.stdev(sentence_lengths) / statistics.mean(sentence_lengths)
+        sentence_variance_score = _clamp(1 - cv)
+    else:
+        sentence_variance_score = 0.5  # not enough sentences to measure
+
+    # 2. Type-token ratio: lower diversity = AI-like.
+    if words:
+        ttr = len(set(w.lower() for w in words)) / len(words)
+        ttr_score = _clamp(1 - ttr)
+    else:
+        ttr_score = 0.5
+
+    # 3. Punctuation density: sparse/regular punctuation = AI-like.
+    punct_chars = len(re.findall(r"[.,;:!?\"'()\-]", text))
+    punct_density = punct_chars / len(text) if text else 0
+    punct_score = _clamp(1 - min(punct_density / 0.08, 1))
+
+    # 4. Average word length: slightly higher = AI-like.
+    if words:
+        avg_word_len = sum(len(w) for w in words) / len(words)
+        word_len_score = _clamp((avg_word_len - 3) / 4)
+    else:
+        word_len_score = 0.5
+
+    # 5. Paragraph/sentence regularity: very even sentences-per-paragraph = AI-like.
+    if len(paragraphs) >= 2:
+        sentences_per_paragraph = [
+            len([s for s in re.split(r"(?<=[.!?])\s+", p.strip()) if s.strip()])
+            for p in paragraphs
+        ]
+        if statistics.mean(sentences_per_paragraph) > 0:
+            cv = statistics.stdev(sentences_per_paragraph) / statistics.mean(sentences_per_paragraph)
+            structure_score = _clamp(1 - cv)
+        else:
+            structure_score = 0.5
+    else:
+        structure_score = 0.5  # single paragraph: not enough structure to measure
+
+    metrics = {
+        "sentence_variance_score": sentence_variance_score,
+        "ttr_score": ttr_score,
+        "punct_score": punct_score,
+        "word_len_score": word_len_score,
+        "structure_score": structure_score,
+    }
+
+    stylo_score = sum(metrics.values()) / len(metrics)
+
+    return {"stylo_score": stylo_score, "metrics": metrics}
+
+
 if __name__ == "__main__":
     test_inputs = [
         "In conclusion, it is important to note that the aforementioned factors collectively "
@@ -51,5 +117,6 @@ if __name__ == "__main__":
 
     for text in test_inputs:
         print(text[:60] + "...")
-        print(llm_signal(text))
+        print("llm:  ", llm_signal(text))
+        print("stylo:", stylo_signal(text))
         print()
