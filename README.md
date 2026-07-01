@@ -252,7 +252,30 @@ Rate limiting is applied per IP address using Flask-Limiter with an in-memory st
 | `POST /appeal` | 3 / hour | Appeals are deliberate, not bulk actions. 3/hour prevents appeal-spam that could overwhelm a reviewer queue. |
 | `GET /log` | 30 / hour | Allows normal reviewer use while preventing automated scraping that could expose patterns useful to adversaries. |
 
-Exceeding a limit returns HTTP 429 with a `Retry-After` header.
+Exceeding a limit returns HTTP 429.
+
+**Verification:** sending 12 rapid requests to `POST /submit` (limit: 10/hour) —
+the first 10 return `200`, the rest return `429`:
+
+```
+$ for i in $(seq 1 12); do
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:5000/submit \
+      -H "Content-Type: application/json" \
+      -d '{"content": "This is a test submission for rate limit testing purposes only.", "creator_id": "ratelimit-test"}'
+  done
+200
+200
+200
+200
+200
+200
+200
+200
+200
+200
+429
+429
+```
 
 ---
 
