@@ -3,10 +3,21 @@ import uuid
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 from signals import llm_signal, stylo_signal
 
 app = Flask(__name__)
+
+# Per-IP rate limits (see README.md's Rate Limiting section for the reasoning
+# behind each number).
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
 
 DB_PATH = "audit_log.db"
 
@@ -168,6 +179,7 @@ def label_for(attribution):
 # --- Routes ---
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per hour")
 def submit():
     # Runs both detection signals, combines them into a single confidence
     # score (Milestone 4), and generates the matching transparency label
@@ -200,6 +212,7 @@ def submit():
 })
 
 @app.route("/appeal", methods=["POST"])
+@limiter.limit("3 per hour")
 def appeal():
     # Milestone 5: creator disputes a decision. Looks up the original
     # submission, validates the creator matches, then flips status to
@@ -230,6 +243,7 @@ def appeal():
     })
 
 @app.route("/log", methods=["GET"])
+@limiter.limit("30 per hour")
 def view_log():
     # Milestone 3: exposes the audit log as JSON so decisions can be inspected/graded.
     return jsonify({"entries": get_log()})
