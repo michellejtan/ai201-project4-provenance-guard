@@ -33,6 +33,15 @@ def init_db():
                 status          TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS appeals (
+                appeal_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_id  TEXT,
+                creator_id  TEXT,
+                appealed_at TEXT,
+                reasoning   TEXT
+            )
+        """)
 
 
 def log_decision(content_id, creator_id, content, llm_score, stylo_score, final_score, attribution, label_text):
@@ -58,6 +67,29 @@ def log_decision(content_id, creator_id, content, llm_score, stylo_score, final_
                 label_text,
                 "decided",
             ),
+        )
+
+
+def get_decision(content_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM decisions WHERE content_id = ?", (content_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def log_appeal(content_id, creator_id, reasoning):
+    # Flips the decision to under_review and appends a linked appeal entry,
+    # matching planning.md's Appeal Flow (no automatic re-classification).
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE decisions SET status = 'under_review' WHERE content_id = ?",
+            (content_id,),
+        )
+        conn.execute(
+            "INSERT INTO appeals (content_id, creator_id, appealed_at, reasoning) VALUES (?, ?, ?, ?)",
+            (content_id, creator_id, datetime.now(timezone.utc).isoformat(), reasoning),
         )
 
 
@@ -166,6 +198,36 @@ def submit():
             "stylo_score": stylo_score,
         },
 })
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    # Milestone 5: creator disputes a decision. Looks up the original
+    # submission, validates the creator matches, then flips status to
+    # under_review and logs the appeal. No automatic re-classification —
+    # a human reviewer reads the audit log later.
+    data = request.get_json()
+
+    content_id = data.get("content_id")
+    creator_id = data.get("creator_id")
+    reasoning = data.get("reasoning", "")
+
+    if not reasoning or len(reasoning) < 10:
+        return jsonify({"error": "reasoning must be at least 10 characters"}), 422
+
+    decision = get_decision(content_id)
+    if decision is None:
+        return jsonify({"error": "content_id not found"}), 404
+
+    if decision["creator_id"] != creator_id:
+        return jsonify({"error": "creator_id does not match the original submission"}), 403
+
+    log_appeal(content_id, creator_id, reasoning)
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Your appeal has been received and this content is now under review.",
+    })
 
 @app.route("/log", methods=["GET"])
 def view_log():
