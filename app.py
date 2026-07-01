@@ -95,14 +95,51 @@ def attribution_for(score):
     return "Uncertain"
 
 
+# --- Transparency labels (Milestone 5) ---
+# Full text for each variant, from planning.md's Transparency Labels section.
+
+_LABEL_TEXT = {
+    "AI": (
+        "Attribution: Likely AI-Generated\n"
+        "Confidence: High\n\n"
+        "Our system analyzed the writing patterns and style of this piece and found strong "
+        "indicators that it was generated with AI assistance. This is not a definitive judgment "
+        "— our detection tools are not perfect, and some human writing styles can resemble "
+        "AI-generated text.\n\n"
+        "If you created this work yourself, you can submit an appeal and explain your process. "
+        "We will review it and update this label."
+    ),
+    "Human": (
+        "Attribution: Likely Human-Written\n"
+        "Confidence: High\n\n"
+        "Our system analyzed the writing patterns and style of this piece and found strong "
+        "indicators that it was written by a person. The language, structure, and style all "
+        "appear consistent with human authorship.\n\n"
+        "If this assessment seems wrong, you can submit an appeal at any time."
+    ),
+    "Uncertain": (
+        "Attribution: Unclear\n"
+        "Confidence: Low\n\n"
+        "Our system analyzed this piece but could not make a confident determination about "
+        "whether it was written by a person or generated with AI assistance. This can happen "
+        "with short texts, experimental writing styles, or pieces that blend human and AI work.\n\n"
+        "No action is taken based on an uncertain result. If you want to provide more context "
+        "about how you created this work, you can submit an appeal."
+    ),
+}
+
+
+def label_for(attribution):
+    return _LABEL_TEXT[attribution]
+
+
 # --- Routes ---
 
 @app.route("/submit", methods=["POST"])
 def submit():
-    # Milestone 4: runs both detection signals, combines them into a single
-    # confidence score per planning.md's weighted formula, and logs the full
-    # signal breakdown. label_text is still a placeholder until Milestone 5's
-    # label generator.
+    # Runs both detection signals, combines them into a single confidence
+    # score (Milestone 4), and generates the matching transparency label
+    # (Milestone 5).
     data = request.get_json()
 
     content = data.get("content")
@@ -115,7 +152,7 @@ def submit():
 
     confidence = compute_confidence(content, llm_score, stylo_score)
     attribution = attribution_for(confidence)
-    label_text = "We're not sure who wrote this."  # placeholder until Milestone 5's label generator
+    label_text = label_for(attribution)
 
     log_decision(content_id, creator_id, content, llm_score, stylo_score, confidence, attribution, label_text)
 
