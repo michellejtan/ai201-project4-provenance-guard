@@ -157,20 +157,35 @@ The confidence score is a float between 0.0 and 1.0 where **higher = more AI-lik
 
 Because falsely labeling human work as AI is considered more harmful than missing some AI-generated work, borderline scores are intentionally routed into the wide uncertain band instead of forcing a binary decision.
 
-**A score of 0.51 vs. 0.95 (high-confidence score):** A 0.51 falls in the uncertain band — the system cannot make
-a confident call and says so explicitly to the user. A 0.95 is high-confidence AI and
-triggers the definitive AI label with no hedging. The key design choice is the wide uncertain
-band (30 points): it absorbs borderline cases rather than forcing a binary call, reflecting the
-asymmetry in harm — misclassifying a human's work as AI is worse than a false negative. The
+**Two real example submissions with noticeably different scores (actual output from Milestone 4 testing):**
+
+*High-confidence case* — a formulaic academic-style paragraph ("In conclusion, it is important
+to note that the aforementioned factors collectively contribute to a comprehensive
+understanding of the subject matter at hand...") produced `llm_score = 0.80`,
+`stylo_score = 0.543`, and `final_score = 0.774`. Both signals agree it reads as AI-generated
+(formulaic transitions, uniform sentence rhythm), so the score lands solidly in the AI band and
+the system commits to the definitive AI label with no hedging.
+
+*Lower-confidence case* — a plain, everyday description ("The weather today was pretty nice,
+sunny with a light breeze. I went for a walk in the park and saw several dogs playing...")
+produced `llm_score = 0.40`, `stylo_score = 0.514`, and `final_score = 0.411`. The LLM's own
+reasoning called this text "moderately likely to be AI-generated" — genuinely torn, because
+plain declarative writing is generic enough to plausibly be either. That ambiguity lands the
+score inside the uncertain band, and the system reports "Unclear" instead of forcing a guess.
+
+These two cases show the scoring isn't a constant: a text where both signals confidently agree
+scores nearly twice as high as one where the LLM itself is unsure, and the combination formula
+preserves that difference rather than collapsing it.
+
+The key design choice behind the bands is the wide uncertain range (30 points): it absorbs
+borderline cases like the second example above rather than forcing a binary call, reflecting
+the asymmetry in harm — misclassifying a human's work as AI is worse than a false negative. The
 human (0–0.34) and AI (0.65–1.00) outer bands are roughly symmetric in width (34 vs. 35 points).
 
-**How scores were tested for meaningfulness:** The same three test inputs were run through both signals individually and combined, and scores were verified to move in the expected direction and route to the correct label variant.
-
-| Test Input | Expected Result |
-|---|---|
-| ChatGPT paragraph (copied verbatim) | Likely AI |
-| Personal journal entry | Likely Human |
-| Short experimental poem | Uncertain |
+**How scores were tested for meaningfulness:** in addition to the two cases above, a personal
+journal entry and a short experimental poem were run through both signals individually and
+combined, and scores were verified to move in the expected direction and route to the correct
+label variant in each case.
 
 ---
 
@@ -365,6 +380,58 @@ and the creator's appeal correctly flipped its status to `under_review` pending 
 
 ---
 
+## Spec Reflection
+
+**Where the spec helped:** Writing the Transparency Labels section in planning.md before any
+code existed meant the exact label text was locked in ahead of time. When it came to
+implementation, `label_for()` in [app.py](app.py) is a pure lookup against a dict of strings
+copied verbatim from the spec — there was no ambiguity to resolve mid-implementation about
+tone or what an "uncertain" result should say to a creator. That upfront decision also made the
+asymmetric-harm reasoning (false-positive-AI is worse than false-negative) concrete before
+threshold numbers were chosen, so the wide uncertain band in `attribution_for()` is a direct
+implementation of a decision made in the spec, not a number picked while coding.
+
+**Where implementation diverged:** planning.md's Audit Log section describes storing the
+LLM's `reasoning` string alongside `ai_probability` ("What every entry must preserve... the full
+signal breakdown"). During implementation this was dropped — `llm_signal()` in
+[signals.py](signals.py) still returns `reasoning`, but `app.py`'s `log_decision()` never
+receives or stores it. The reason: the reasoning string is free-form natural-language output
+from the LLM, and its wording is not stable across model versions or even temperature settings,
+so it isn't something a reviewer could reliably compare across audit log entries. Storing the
+numeric score (which is well-defined and comparable) while discarding the prose explanation
+gives more consistent long-term auditability at the cost of losing a human-readable rationale
+for any single decision — a tradeoff the spec hadn't anticipated when it said to preserve the
+"full signal breakdown."
+
+---
+
+## AI Usage
+
+This project was built with Claude Code assistance, using planning.md as the spec that guided
+every prompt (see the AI Tool Plan section of [planning.md](planning.md) for what was scoped to
+each milestone). Two concrete instances:
+
+1. **Milestone 3 scaffold, later replaced.** I directed Claude to build the initial `/submit`
+   endpoint wired only to the LLM signal, before the spec's scoring and label sections were
+   implemented. What it produced was intentionally throwaway: a binary threshold
+   (`"AI" if ai_probability >= 0.5 else "Human"`) and a hardcoded placeholder string
+   (`"We're not sure who wrote this."`) standing in for the real label text. In Milestones 4 and
+   5 I directed Claude to replace both — the binary threshold with the three-band
+   `attribution_for()` (wide uncertain range, per planning.md's asymmetric-harm reasoning) and
+   the placeholder string with the verbatim label text from planning.md's Transparency Labels
+   section, copied via `label_for()`. Nothing from the Milestone 3 placeholder logic survived
+   into the final version.
+2. **Stylometric signal (Milestone 4).** I directed Claude to implement `stylo_signal()` in
+   [signals.py](signals.py) directly from the five-metric table in planning.md (sentence-length
+   variance, TTR, punctuation density, average word length, paragraph/sentence regularity).
+   What it produced matched the spec's formulas on the first pass and needed no functional
+   correction — I reviewed each metric against the spec table line-by-line and kept the
+   implementation as generated, which is itself a data point: spec sections detailed enough to
+   specify the exact statistic and direction of each metric (not just "measure vocabulary
+   diversity" but "TTR, lower = more AI-like") produced code that didn't need revising.
+
+---
+
 ## Setup
 
 ```bash
@@ -373,7 +440,7 @@ cd ai201-project4-provenance-guard
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # add your GROQ_API_KEY
+touch .env   # add your GROQ_API_KEY
 python app.py
 ```
 
