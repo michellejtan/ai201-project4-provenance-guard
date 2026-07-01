@@ -285,42 +285,48 @@ Every classification decision and appeal is persisted to SQLite in two tables.
 | `appealed_at` | TEXT | ISO 8601 timestamp |
 | `reasoning` | TEXT | Creator's explanation |
 
-**Sample audit log output** (from `GET /log` — returns a subset of the full schema; `content_preview` and `label_text` are omitted for brevity):
+**Sample audit log output** (real output from `GET /log`, run against three test submissions
+— `content_preview` and `label_text` are omitted below for brevity; the third entry shows
+`status: "under_review"` after its creator filed an appeal):
 
 ```json
 [
   {
-    "content_id": "poem-001",
-    "creator_id": "user-42",
-    "submitted_at": "2026-06-28T14:05:00Z",
-    "llm_score": 0.88,
-    "stylo_score": 0.67,
-    "final_score": 0.81,
+    "content_id": "9e92ba42-d1d4-4c54-af1f-75407b2e5aaf",
+    "creator_id": "demo-user-1",
+    "submitted_at": "2026-07-01T00:21:16.425173+00:00",
+    "llm_score": 0.8,
+    "stylo_score": 0.5168627618917853,
+    "final_score": 0.7716862761891786,
     "attribution": "AI",
     "status": "decided"
   },
   {
-    "content_id": "story-007",
-    "creator_id": "user-11",
-    "submitted_at": "2026-06-28T14:12:00Z",
-    "llm_score": 0.21,
-    "stylo_score": 0.33,
-    "final_score": 0.25,
+    "content_id": "1caca6ca-f787-4087-bb05-5917c837e02a",
+    "creator_id": "demo-user-2",
+    "submitted_at": "2026-07-01T00:21:26.497819+00:00",
+    "llm_score": 0.2,
+    "stylo_score": 0.35585097811810146,
+    "final_score": 0.21558509781181018,
     "attribution": "Human",
     "status": "decided"
   },
   {
-    "content_id": "essay-003",
-    "creator_id": "user-88",
-    "submitted_at": "2026-06-28T14:20:00Z",
-    "llm_score": 0.54,
-    "stylo_score": 0.48,
-    "final_score": 0.52,
-    "attribution": "Uncertain",
+    "content_id": "02f43342-2e47-4929-8cf8-131907bbca28",
+    "creator_id": "demo-user-3",
+    "submitted_at": "2026-07-01T00:21:27.247354+00:00",
+    "llm_score": 0.8,
+    "stylo_score": 0.6219719361479459,
+    "final_score": 0.7821971936147947,
+    "attribution": "AI",
     "status": "under_review"
   }
 ]
 ```
+
+The third entry is a real illustration of the system's documented formal-writing blind spot
+(see Known Limitations below): a formal economics paragraph was misclassified as AI-generated,
+and the creator's appeal correctly flipped its status to `under_review` pending human review.
 
 ---
 
