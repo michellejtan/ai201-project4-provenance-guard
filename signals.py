@@ -105,6 +105,51 @@ def stylo_signal(text):
     return {"stylo_score": stylo_score, "metrics": metrics}
 
 
+_GENERIC_CAPTION_PHRASES = [
+    r"a photo of", r"an image of", r"a picture of", r"this image shows",
+    r"this photo shows", r"depicting", r"featuring", r"in this image",
+    r"a photograph of", r"showing a", r"showing an",
+]
+
+
+def caption_signal(text):
+    # Tailored for short image-caption/alt-text strings rather than prose:
+    # AI-generated captions lean on generic templated openers and rarely
+    # name specific entities, counts, or proper nouns the way a human
+    # describing their own photo would.
+    words = re.findall(r"[A-Za-z']+", text)
+    lower = text.lower()
+
+    # 1. Generic opener phrases: AI captions overwhelmingly start this way.
+    generic_hits = sum(1 for phrase in _GENERIC_CAPTION_PHRASES if re.search(phrase, lower))
+    generic_score = _clamp(generic_hits / 2)  # 2+ hits already maxes the score
+
+    # 2. Specificity: proper nouns (capitalized mid-string) and digits suggest
+    # a human naming a real place, person, or count. Their absence = AI-like.
+    proper_nouns = re.findall(r"(?<!^)(?<![.!?]\s)\b[A-Z][a-z]+", text)
+    digits = re.findall(r"\d+", text)
+    specificity_hits = len(proper_nouns) + len(digits)
+    specificity_score = _clamp(1 - min(specificity_hits / 2, 1))
+
+    # 3. Length: AI captions cluster in a narrow mid-length band; very short
+    # or very long captions are more often human-written (terse or rambling).
+    word_count = len(words)
+    if 6 <= word_count <= 20:
+        length_score = 0.7
+    else:
+        length_score = 0.3
+
+    metrics = {
+        "generic_phrase_score": generic_score,
+        "specificity_score": specificity_score,
+        "length_score": length_score,
+    }
+
+    caption_score = sum(metrics.values()) / len(metrics)
+
+    return {"caption_score": caption_score, "metrics": metrics}
+
+
 if __name__ == "__main__":
     test_inputs = [
         "In conclusion, it is important to note that the aforementioned factors collectively "

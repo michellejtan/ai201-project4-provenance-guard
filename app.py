@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from signals import llm_signal, stylo_signal
+from signals import llm_signal, stylo_signal, caption_signal
 
 app = Flask(__name__)
 
@@ -21,6 +21,18 @@ limiter = Limiter(
 
 DB_PATH = "audit_log.db"
 
+# Pool of single-use identity-verification codes, simulating an out-of-band
+# check (e.g. distributed at course enrollment or via email confirmation).
+# Redeeming one via POST /verify earns the creator a provenance certificate.
+_DEMO_VERIFICATION_CODES = [f"VERIFY-DEMO-{i}" for i in range(1, 11)]
+
+_CERTIFICATE_TEXT = (
+    "✓ Verified Human Creator\n\n"
+    "This creator has completed an independent identity-verification step. "
+    "This badge certifies the creator's identity — it is not a per-submission "
+    "content analysis, and does not affect the Attribution label above."
+)
+
 
 # --- Audit log (SQLite) ---
 # Milestone 3: persist every classification decision so submissions are auditable
@@ -32,16 +44,18 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS decisions (
-                content_id      TEXT PRIMARY KEY,
-                creator_id      TEXT,
-                submitted_at    TEXT,
-                content_preview TEXT,
-                llm_score       REAL,
-                stylo_score     REAL,
-                final_score     REAL,
-                attribution     TEXT,
-                label_text      TEXT,
-                status          TEXT
+                content_id       TEXT PRIMARY KEY,
+                creator_id       TEXT,
+                submitted_at     TEXT,
+                content_type     TEXT,
+                content_preview  TEXT,
+                llm_score        REAL,
+                stylo_score      REAL,
+                final_score      REAL,
+                attribution      TEXT,
+                label_text       TEXT,
+                creator_verified INTEGER,
+                status           TEXT
             )
         """)
         conn.execute("""
@@ -53,32 +67,88 @@ def init_db():
                 reasoning   TEXT
             )
         """)
+        # --- Provenance certificate (Milestone 6 extra credit) ---
+        # `creators`: which creator_ids have earned the "verified human" badge.
+        # `verification_codes`: a pool of single-use codes simulating an
+        # out-of-band identity check (e.g. handed out at course enrollment).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS creators (
+                creator_id  TEXT PRIMARY KEY,
+                verified_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS verification_codes (
+                code    TEXT PRIMARY KEY,
+                used_by TEXT,
+                used_at TEXT
+            )
+        """)
+        for code in _DEMO_VERIFICATION_CODES:
+            conn.execute(
+                "INSERT OR IGNORE INTO verification_codes (code, used_by, used_at) VALUES (?, NULL, NULL)",
+                (code,),
+            )
 
 
-def log_decision(content_id, creator_id, content, llm_score, stylo_score, final_score, attribution, label_text):
+def log_decision(content_id, creator_id, content, content_type, llm_score, stylo_score,
+                  final_score, attribution, label_text, creator_verified):
     # Writes one structured row per /submit call: who submitted what, both
     # signal scores, the combined score, and the label text shown to them.
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             INSERT INTO decisions
-                (content_id, creator_id, submitted_at, content_preview,
-                 llm_score, stylo_score, final_score, attribution, label_text, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (content_id, creator_id, submitted_at, content_type, content_preview,
+                 llm_score, stylo_score, final_score, attribution, label_text,
+                 creator_verified, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 content_id,
                 creator_id,
                 datetime.now(timezone.utc).isoformat(),
+                content_type,
                 content[:200],  # only store a preview, not the full submitted text
                 llm_score,
                 stylo_score,
                 final_score,
                 attribution,
                 label_text,
+                int(creator_verified),
                 "decided",
             ),
         )
+
+
+def is_creator_verified(creator_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM creators WHERE creator_id = ?", (creator_id,)
+        ).fetchone()
+    return row is not None
+
+
+def verify_creator(creator_id, code):
+    # Redeems a single-use verification code for a creator_id. Returns True
+    # if the code was valid and unused, False otherwise (already used, or
+    # doesn't exist).
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT used_by FROM verification_codes WHERE code = ?", (code,)
+        ).fetchone()
+        if row is None or row[0] is not None:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE verification_codes SET used_by = ?, used_at = ? WHERE code = ?",
+            (creator_id, now, code),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO creators (creator_id, verified_at) VALUES (?, ?)",
+            (creator_id, now),
+        )
+        return True
 
 
 def get_decision(content_id):
@@ -114,18 +184,67 @@ def get_log(limit=20):
     return [dict(row) for row in rows]
 
 
+def get_analytics():
+    # Milestone 6 extra credit: aggregate metrics across the audit log.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        decisions = [dict(r) for r in conn.execute("SELECT * FROM decisions").fetchall()]
+        appeal_count = conn.execute("SELECT COUNT(*) FROM appeals").fetchone()[0]
+        verified_creator_count = conn.execute("SELECT COUNT(*) FROM creators").fetchone()[0]
+
+    total = len(decisions)
+
+    # Metric 1: detection pattern — ratio of AI vs Human vs Uncertain verdicts.
+    breakdown = {"AI": 0, "Human": 0, "Uncertain": 0}
+    for d in decisions:
+        breakdown[d["attribution"]] = breakdown.get(d["attribution"], 0) + 1
+    attribution_ratio = {
+        k: round(v / total, 4) if total else 0.0 for k, v in breakdown.items()
+    }
+
+    # Metric 2: appeal rate — appeals filed per submission.
+    appeal_rate = round(appeal_count / total, 4) if total else 0.0
+
+    # Metric 3 (chosen metric): signal agreement rate — how often the two
+    # underlying signals (llm vs. stylo/caption) land on the same side of the
+    # 0.5 midpoint. Low agreement flags content where the signals are
+    # fighting each other, which is exactly the content most worth a human's
+    # attention regardless of which side the combined score fell on.
+    agree = 0
+    for d in decisions:
+        if (d["llm_score"] >= 0.5) == (d["stylo_score"] >= 0.5):
+            agree += 1
+    signal_agreement_rate = round(agree / total, 4) if total else 0.0
+
+    return {
+        "total_submissions": total,
+        "detection_pattern": {
+            "counts": breakdown,
+            "ratio": attribution_ratio,
+        },
+        "appeal_rate": appeal_rate,
+        "signal_agreement_rate": signal_agreement_rate,
+        "verified_creator_count": verified_creator_count,
+    }
+
+
 init_db()  # ensure the table exists before the app starts handling requests
 
 
 # --- Confidence scoring (Milestone 4) ---
 
-def compute_confidence(content, llm_score, stylo_score):
+def compute_confidence(content, llm_score, second_score, content_type):
     # Weights per planning.md: short texts (<80 words) get near-zero weight on
     # the stylometric signal, since that signal needs sample size to be reliable.
+    # Image captions use a flat 0.5/0.5 split instead: the word-count-based
+    # split doesn't apply to inherently short caption text, and the caption
+    # signal hasn't been validated enough to justify weighting it above parity.
+    if content_type == "image_caption":
+        return (0.50 * llm_score) + (0.50 * second_score)
     word_count = len(content.split())
     if word_count < 80:
-        return (0.90 * llm_score) + (0.10 * stylo_score)
-    return (0.65 * llm_score) + (0.35 * stylo_score)
+        return (0.90 * llm_score) + (0.10 * second_score)
+    return (0.65 * llm_score) + (0.35 * second_score)
 
 
 def attribution_for(score):
@@ -183,33 +302,52 @@ def label_for(attribution):
 def submit():
     # Runs both detection signals, combines them into a single confidence
     # score (Milestone 4), and generates the matching transparency label
-    # (Milestone 5).
+    # (Milestone 5). `content_type` selects which second signal runs
+    # alongside the shared LLM signal (Milestone 6: multi-modal support).
     data = request.get_json()
 
     content = data.get("content")
     creator_id = data.get("creator_id")
+    content_type = data.get("content_type", "text")
+
+    if content_type not in ("text", "image_caption"):
+        return jsonify({"error": "content_type must be 'text' or 'image_caption'"}), 422
 
     content_id = str(uuid.uuid4())  # generated server-side so the client can't spoof/collide IDs
 
-    llm_score = llm_signal(content)["ai_probability"]  # Signal 1: Groq LLM classifier
-    stylo_score = stylo_signal(content)["stylo_score"]  # Signal 2: stylometric heuristics
+    llm_score = llm_signal(content)["ai_probability"]  # Signal 1: Groq LLM classifier, shared across content types
+    if content_type == "image_caption":
+        second_score = caption_signal(content)["caption_score"]  # Signal 2: caption-specific heuristics
+    else:
+        second_score = stylo_signal(content)["stylo_score"]  # Signal 2: stylometric heuristics
 
-    confidence = compute_confidence(content, llm_score, stylo_score)
+    confidence = compute_confidence(content, llm_score, second_score, content_type)
     attribution = attribution_for(confidence)
     label_text = label_for(attribution)
 
-    log_decision(content_id, creator_id, content, llm_score, stylo_score, confidence, attribution, label_text)
+    creator_verified = is_creator_verified(creator_id)
 
-    return jsonify({
+    log_decision(content_id, creator_id, content, content_type, llm_score, second_score,
+                 confidence, attribution, label_text, creator_verified)
+
+    response = {
         "content_id": content_id,
+        "content_type": content_type,
         "attribution": attribution,
         "confidence": confidence,
         "label": label_text,
         "signals": {
             "llm_score": llm_score,
-            "stylo_score": stylo_score,
+            "caption_score" if content_type == "image_caption" else "stylo_score": second_score,
         },
-})
+    }
+    # Provenance certificate (Milestone 6): shown as a separate field from
+    # the attribution label so it's visually distinguishable — it certifies
+    # the creator's identity, not this piece of content.
+    if creator_verified:
+        response["certificate"] = _CERTIFICATE_TEXT
+
+    return jsonify(response)
 
 @app.route("/appeal", methods=["POST"])
 @limiter.limit("3 per hour")
@@ -247,6 +385,43 @@ def appeal():
 def view_log():
     # Milestone 3: exposes the audit log as JSON so decisions can be inspected/graded.
     return jsonify({"entries": get_log()})
+
+@app.route("/verify", methods=["POST"])
+@limiter.limit("5 per hour")
+def verify():
+    # Milestone 6 extra credit: redeems a single-use verification code to
+    # earn the creator a provenance certificate. This is the "additional
+    # verification step" — a stand-in for an out-of-band identity check
+    # (e.g. a code emailed after enrollment/account confirmation).
+    data = request.get_json()
+
+    creator_id = data.get("creator_id")
+    verification_code = data.get("verification_code")
+
+    if not creator_id or not verification_code:
+        return jsonify({"error": "creator_id and verification_code are required"}), 422
+
+    if is_creator_verified(creator_id):
+        return jsonify({
+            "creator_id": creator_id,
+            "verified": True,
+            "certificate": _CERTIFICATE_TEXT,
+        })
+
+    if not verify_creator(creator_id, verification_code):
+        return jsonify({"error": "verification_code is invalid or already used"}), 403
+
+    return jsonify({
+        "creator_id": creator_id,
+        "verified": True,
+        "certificate": _CERTIFICATE_TEXT,
+    })
+
+@app.route("/analytics", methods=["GET"])
+@limiter.limit("30 per hour")
+def analytics():
+    # Milestone 6 extra credit: dashboard metrics computed live from the audit log.
+    return jsonify(get_analytics())
 
 @app.route("/")
 def home():

@@ -29,6 +29,8 @@ and the AI Tool Plan used to generate implementation code.
 | `POST` | `/submit` | Submit content for classification |
 | `POST` | `/appeal` | Submit an appeal for a prior decision |
 | `GET` | `/log` | Retrieve recent audit log entries |
+| `POST` | `/verify` | Redeem a verification code to earn a provenance certificate |
+| `GET` | `/analytics` | Retrieve aggregate detection/appeal metrics |
 
 ### POST /submit
 
@@ -36,20 +38,25 @@ and the AI Tool Plan used to generate implementation code.
 ```json
 {
   "creator_id": "user-42",
-  "content": "The text to classify..."
+  "content": "The text to classify...",
+  "content_type": "text"
 }
 ```
 
 `content_id` is generated server-side (not supplied by the client) to avoid collisions and
 client-spoofed IDs. It is returned in the response and used for appeals.
 
+`content_type` is optional and defaults to `"text"`. Set it to `"image_caption"` to route
+through the multi-modal pipeline (see [Multi-Modal Support](#multi-modal-support) below).
+
 **Response:**
 ```json
 {
   "content_id": "3f7a2b1e-...",
+  "content_type": "text",
   "attribution": "AI",
   "confidence": 0.81,
-  "label_text": "Attribution: Likely AI-Generated\n...",
+  "label": "Attribution: Likely AI-Generated\n...",
   "signals": {
     "llm_score": 0.88,
     "stylo_score": 0.67
@@ -57,9 +64,12 @@ client-spoofed IDs. It is returned in the response and used for appeals.
 }
 ```
 
+If `creator_id` has an earned provenance certificate (see below), the response also includes
+a `certificate` field alongside — never in place of — the standard `label`.
+
 **HTTP status codes:**
 - `200` — Classification completed successfully
-- `422` — Missing or invalid request data (e.g., missing `content`)
+- `422` — Missing or invalid request data (e.g., missing `content`, or an unrecognized `content_type`)
 - `429` — Rate limit exceeded
 
 ### POST /appeal
@@ -95,6 +105,40 @@ Returns the most recent audit log entries ordered by submission time (newest fir
 
 **HTTP status codes:**
 - `200` — Log entries returned successfully
+- `429` — Rate limit exceeded
+
+### POST /verify
+
+**Request body:**
+```json
+{
+  "creator_id": "user-42",
+  "verification_code": "VERIFY-DEMO-1"
+}
+```
+
+**Response:**
+```json
+{
+  "creator_id": "user-42",
+  "verified": true,
+  "certificate": "✓ Verified Human Creator\n\n..."
+}
+```
+
+**HTTP status codes:**
+- `200` — Code redeemed (or creator was already verified)
+- `403` — `verification_code` is invalid or already used by another creator
+- `422` — Missing `creator_id` or `verification_code`
+- `429` — Rate limit exceeded
+
+### GET /analytics
+
+Returns aggregate metrics computed live from the audit log. See
+[Analytics Dashboard](#analytics-dashboard) below for the full metric definitions.
+
+**HTTP status codes:**
+- `200` — Metrics returned successfully
 - `429` — Rate limit exceeded
 
 ---
@@ -294,6 +338,103 @@ $ for i in $(seq 1 12); do
 
 ---
 
+## Provenance Certificate
+
+A provenance certificate is a **creator-level** credential — separate from the per-submission
+Attribution label — that certifies a creator has completed an identity-verification step, not
+that any particular piece of content is human-written.
+
+**Verification step:** the creator redeems a single-use verification code via `POST /verify`.
+Codes stand in for an out-of-band identity check (e.g. one emailed after account or course
+enrollment confirmation) — a real deployment would issue these through whatever channel
+already proves the creator is who they say they are. Each code can only be redeemed once, by
+one creator; redeeming it permanently marks that `creator_id` as verified.
+
+**Display:** once verified, every subsequent `/submit` response for that creator includes a
+`certificate` field in addition to the normal `label`:
+
+```
+✓ Verified Human Creator
+
+This creator has completed an independent identity-verification step. This badge certifies
+the creator's identity — it is not a per-submission content analysis, and does not affect
+the Attribution label above.
+```
+
+This is intentionally distinguishable from the transparency label in three ways: it appears
+in a separate JSON field (`certificate`, not `label`), it uses different language ("Verified
+Human Creator" vs. "Likely AI/Human-Generated"), and its own text explicitly disclaims that it
+does not override or influence the Attribution result — a verified creator can still submit
+content that scores as `AI` (e.g. if they paste in AI-assisted text); the certificate is about
+who they are, not what they submitted.
+
+---
+
+## Analytics Dashboard
+
+`GET /analytics` computes three metrics live from the audit log:
+
+| Metric | What it shows | Why it was chosen |
+|---|---|---|
+| **Detection pattern** | Counts and ratio of `AI` / `Human` / `Uncertain` verdicts across all submissions | The rubric's required "ratio of AI vs. human verdicts" metric |
+| **Appeal rate** | `appeals filed / total submissions` | The rubric's required appeal-rate metric; a rising rate signals the model is drifting or creators are unhappy with results |
+| **Signal agreement rate** | Fraction of submissions where `llm_score` and the second signal (`stylo_score` or `caption_score`) land on the same side of the 0.5 midpoint | Chosen metric: low agreement flags exactly the content most worth a human reviewer's attention, regardless of which side the *combined* score happened to fall on — two signals disagreeing is a stronger "look at this" flag than a single borderline score |
+
+**Sample response** (from the manual test run below):
+```json
+{
+  "total_submissions": 5,
+  "detection_pattern": {
+    "counts": {"AI": 3, "Human": 2, "Uncertain": 0},
+    "ratio": {"AI": 0.6, "Human": 0.4, "Uncertain": 0.0}
+  },
+  "appeal_rate": 0.2,
+  "signal_agreement_rate": 0.8,
+  "verified_creator_count": 1
+}
+```
+
+`verified_creator_count` (total creators holding a provenance certificate) is reported
+alongside the three required metrics as extra context, not as a fourth graded metric.
+
+---
+
+## Multi-Modal Support
+
+`POST /submit` accepts an optional `content_type` field: `"text"` (default) or
+`"image_caption"`. Both content types share Signal 1 (the Groq LLM classifier, which works on
+any text input), but Signal 2 differs:
+
+| `content_type` | Signal 1 | Signal 2 | Combination weights |
+|---|---|---|---|
+| `text` | LLM classifier | Stylometric heuristics (5 metrics) | 0.65/0.35 (≥80 words) or 0.90/0.10 (<80 words) |
+| `image_caption` | LLM classifier | Caption heuristics (3 metrics, below) | 0.50/0.50 (flat) |
+
+**Signal 2 for captions — `caption_signal()` in [signals.py](signals.py):**
+
+| Metric | What it captures | AI pattern |
+|---|---|---|
+| Generic phrase score | Templated openers ("a photo of", "this image shows", "depicting"...) | AI captions overwhelmingly start this way |
+| Specificity score | Proper nouns and digits (names, places, counts) | Their absence = AI-like; humans describing their own photo tend to name specifics |
+| Length score | Word count relative to a 6–20 word band | AI captions cluster in that narrow band; very short or very long captions are more often human |
+
+The word-count-based weight split used for plain text doesn't transfer to captions — captions
+are inherently short, so word count isn't a meaningful reliability signal the way it is for
+prose. A flat 0.50/0.50 split is used instead, since the caption signal hasn't been validated
+enough to justify weighting it above or below the LLM signal.
+
+**Verified example outputs (real, from a local test run):**
+- `"A photo of a dog sitting on a couch in a living room."` → `llm_score=0.95`,
+  `caption_score=0.73`, `final_score=0.84` → **AI** (generic opener, no names, no counts)
+- `"My dog Biscuit, age 3, crashed on the couch at 4pm after we hiked Mount Tam."` →
+  `llm_score=0.20`, `caption_score=0.23`, `final_score=0.22` → **Human** (named subject,
+  specific age/time/place)
+
+The same attribution/label/certificate pipeline downstream of signal computation is reused
+unchanged — `content_type` only changes which Signal 2 runs and how the two scores are weighted.
+
+---
+
 ## Audit Log
 
 Every classification decision and appeal is persisted to SQLite in two tables.
@@ -305,13 +446,19 @@ Every classification decision and appeal is persisted to SQLite in two tables.
 | `content_id` | TEXT PK | Unique ID from the submission |
 | `creator_id` | TEXT | Submitter identifier |
 | `submitted_at` | TEXT | ISO 8601 timestamp |
+| `content_type` | TEXT | "text" \| "image_caption" |
 | `content_preview` | TEXT | First 200 chars of submitted text |
 | `llm_score` | REAL | Raw output of Signal 1 |
-| `stylo_score` | REAL | Raw output of Signal 2 |
+| `stylo_score` | REAL | Raw output of Signal 2 (stylometric or caption heuristics, depending on `content_type`) |
 | `final_score` | REAL | Weighted combined score |
 | `attribution` | TEXT | "AI" \| "Human" \| "Uncertain" |
 | `label_text` | TEXT | Exact label text shown to the user |
+| `creator_verified` | INTEGER | 1 if `creator_id` held a provenance certificate at submission time, else 0 |
 | `status` | TEXT | "decided" \| "under_review" |
+
+Two more tables support the provenance certificate: `creators` (`creator_id`, `verified_at`)
+and `verification_codes` (`code`, `used_by`, `used_at`) — a single-use code pool seeded on
+startup.
 
 **`appeals` table columns:**
 
